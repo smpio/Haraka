@@ -11,11 +11,13 @@ const spawn     = require('child_process').spawn;
 const stream    = require('stream');
 const tls       = require('tls');
 const util      = require('util');
+const plugins   = require('./plugins');
 
 // npm packages
 const async     = require('async');
 const openssl   = require('openssl-wrapper').exec;
 exports.config  = require('haraka-config');  // exported for tests
+const Notes       = require('haraka-notes');
 
 const log       = require('./logger');
 
@@ -115,7 +117,6 @@ class pluggableStream extends stream.Stream {
         }
         return false;
     }
-
     end (data, encoding) {
         if (this.targetsocket.end) {
             return this.targetsocket.end(data, encoding);
@@ -648,7 +649,7 @@ function createServer (cb) {
 }
 
 function connect (port, host, cb) {
-    let conn_options = {};
+    var conn_options = {};
     if (typeof port === 'object') {
         conn_options = port;
         cb = host;
@@ -657,9 +658,9 @@ function connect (port, host, cb) {
         conn_options.port = port;
         conn_options.host = host;
     }
+    conn_options.notes = new Notes();
 
-    const cryptoSocket = net.connect(conn_options);
-
+    var cryptoSocket = net.connect(conn_options);
     const socket = new pluggableStream(cryptoSocket);
 
     socket.upgrade = (options, cb2) => {
@@ -709,3 +710,4 @@ exports.connect = connect;
 exports.createConnection = connect;
 exports.Server = createServer;
 exports.createServer = createServer;
+exports.pluggableStream = pluggableStream;

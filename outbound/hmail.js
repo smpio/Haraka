@@ -293,7 +293,7 @@ class HMailItem extends events.EventEmitter {
             this.todo.rcpt_to.forEach(function (rcpt) {
                 self.extend_rcpt_with_dsn(rcpt, DSN.addr_bad_dest_system(`Tried all MXs${self.todo.domain}`));
             });
-            return this.temp_fail("Tried all MXs");
+            return this.bounce("Tried all MXs");
         }
 
         const mx   = this.mxlist.shift();
@@ -330,7 +330,6 @@ class HMailItem extends events.EventEmitter {
 
     try_deliver_host (mx) {
         const self = this;
-
         if (self.hostlist.length === 0) {
             return self.try_deliver(); // try next MX
         }
@@ -350,22 +349,30 @@ class HMailItem extends events.EventEmitter {
             }
         }
 
+        // Allow transaction notes to set socks
+        let proxy;
+        if (self.todo.notes.proxy){
+            proxy = self.todo.notes.proxy
+        }
+
         let host = self.hostlist.shift();
         const port = mx.port || 25;
 
         if (mx.path) {
             host = mx.path;
         }
-
         this.loginfo(`Attempting to deliver to: ${host}:${port}${mx.using_lmtp ? " using LMTP" : ""} (${delivery_queue.length()}) (${temp_fail_queue.length()})`);
         client_pool.get_client(port, host, mx.bind, mx.path ? true : false, function (err, socket) {
             if (err) {
+                if (err.stack.indexOf('ECONNREFUSED') > -1){
+                    return self.bounce("unspecified");
+                }
                 logger.logerror(`[outbound] Failed to get pool entry: ${err}`);
                 // try next host
                 return self.try_deliver_host(mx);
             }
             self.try_deliver_host_on_socket(mx, host, port, socket);
-        });
+        }, proxy);
     }
 
     try_deliver_host_on_socket (mx, host, port, socket) {

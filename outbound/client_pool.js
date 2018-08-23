@@ -9,41 +9,171 @@ const logger       = require('../logger');
 
 const cfg          = require('./config');
 
-function _create_socket (pool_name, port, host, local_addr, is_unix_socket, callback) {
-    const socket = is_unix_socket ? sock.connect({path: host}) :
-        sock.connect({port: port, host: host, localAddress: local_addr});
-    socket.__pool_name = pool_name;
-    socket.__uuid = utils.uuid();
-    socket.setTimeout(cfg.connect_timeout * 1000);
-    logger.logdebug(
-        '[outbound] created',
-        {
-            uuid: socket.__uuid,
-            host: host,
-            port: port,
-            pool_timeout: cfg.pool_timeout
+const tls       = require('tls');
+
+const SocksClient = require('socks').SocksClient;
+
+const log       = require('../logger');
+
+const pluggableStream = require('../tls_socket').pluggableStream
+
+
+function setup_line_processor (socket) {
+    let current_data = '';
+    socket.process_data = function (data) {
+        current_data += data;
+        let results;
+        while ((results = utils.line_regexp.exec(current_data))) {
+            const this_line = results[1];
+            current_data = current_data.slice(this_line.length);
+            socket.emit('line', this_line);
         }
-    );
-    socket.once('connect', function () {
+    };
+
+    socket.process_end = function () {
+        if (current_data.length) {
+            socket.emit('line', current_data);
+        }
+        current_data = '';
+    };
+
+    socket.on('data', function (data) { socket.process_data(data);});
+    socket.on('end',  function ()     { socket.process_end();     });
+}
+
+const certsByHost = {};
+const ctxByHost = {};
+
+function pipe (cleartext, socket) {
+    cleartext.socket = socket;
+
+    function onError (e) {
+    }
+
+    function onClose () {
+        socket.removeListener('error', onError);
+        socket.removeListener('close', onClose);
+    }
+
+    socket.on('error', onError);
+    socket.on('close', onClose);
+}
+
+function _create_socket (pool_name, port, host, local_addr, is_unix_socket, callback, proxy) {
+
+    if(proxy){
+        if(proxy.proxy.ipaddress === host){
+            host = '127.0.0.1';
+            proxy = undefined;
+        }
+    }
+    if(!proxy || is_unix_socket){
+        var socket = is_unix_socket ? sock.connect({path: host}) :
+            sock.connect({port: port, host: host, localAddress: local_addr});
+        socket.__pool_name = pool_name;
+        socket.__uuid = utils.uuid();
+        socket.setTimeout(cfg.connect_timeout * 2000);
+        logger.logdebug(
+            '[outbound] created',
+            {
+                uuid: socket.__uuid,
+                host: host,
+                port: port,
+                pool_timeout: cfg.pool_timeout
+            }
+        );
+        socket.once('connect', function () {
+            socket.removeAllListeners('error'); // these get added after callback
+            socket.removeAllListeners('timeout');
+            callback(null, socket);
+        });
+        socket.once('error', function (err) {
+            socket.end();
+            callback(`Outbound connection error: ${err}`, null);
+        });
+        socket.once('timeout', function () {
+            socket.end();
+            callback(`Outbound connection timed out to ${host}:${port}`, null);
+        });
+    }else{
+        let proxy_options = Object.assign({}, proxy);
+        proxy_options.destination = {
+            host: host,
+            port: port
+        };
+        proxy_options.command = 'connect';
+        SocksClient.createConnection(proxy_options, (err, info) => {
+            if (err) {
+                return callback(err, null);
+            }
+            var cryptoSocket = new pluggableStream(info.socket);
+            setup_line_processor(cryptoSocket);
+            const socket = cryptoSocket;
+            socket.upgrade = (options, cb2) => {
+
+                options = Object.assign(options, certsByHost['*']);
+                options.socket = info.socket;
+
+                var cleartext = new tls.connect(options);
+                pipe(cleartext, cryptoSocket);
+
+                cleartext.on('error', err => {
+                    if (err.reason) {
+                    log.logerror("client TLS error: " + err);
+                }
+            })
+            cleartext.getPeerCertificate();
+            cleartext.getCipher();
+
+
+            socket.cleartext = cleartext;
+
+            if (socket._timeout) {
+                cleartext.setTimeout(socket._timeout);
+            }
+
+            cleartext.setKeepAlive(socket._keepalive);
+            setup_line_processor(socket.cleartext);
+            socket.attach(socket.cleartext);
+
+            log.logdebug('client TLS upgrade in progress, awaiting secured.');
+
+        }
+        socket.__pool_name = pool_name;
+        socket.__uuid = utils.uuid();
+        socket.setTimeout(cfg.connect_timeout * 3000);
+        logger.logdebug(
+            '[outbound] created',
+            {
+                uuid: socket.__uuid,
+                host: host,
+                port: port,
+                pool_timeout: cfg.pool_timeout
+            }
+        );
         socket.removeAllListeners('error'); // these get added after callback
         socket.removeAllListeners('timeout');
         callback(null, socket);
     });
-    socket.once('error', function (err) {
-        socket.end();
-        callback(`Outbound connection error: ${err}`, null);
-    });
-    socket.once('timeout', function () {
-        socket.end();
-        callback(`Outbound connection timed out to ${host}:${port}`, null);
-    });
+
+
+    }
 }
 
+
 // Separate pools are kept for each set of server attributes.
-function get_pool (port, host, local_addr, is_unix_socket, max) {
+function get_pool (port, host, local_addr, is_unix_socket, max, proxy) {
     port = port || 25;
     host = host || 'localhost';
-    const name = `outbound::${port}:${host}:${local_addr}:${cfg.pool_timeout}`;
+
+    var proxy_ip = '';
+    if(proxy && proxy.proxy){
+        proxy_ip = proxy.proxy.ipaddress;
+    }else{
+        proxy = undefined
+    }
+
+    const name = `outbound::${port}:${host}:${local_addr}:${cfg.pool_timeout}:${proxy_ip}`;
     if (!server.notes.pool) {
         server.notes.pool = {};
     }
@@ -51,7 +181,7 @@ function get_pool (port, host, local_addr, is_unix_socket, max) {
         const pool = generic_pool.Pool({
             name: name,
             create: function (done) {
-                _create_socket(this.name, port, host, local_addr, is_unix_socket, done);
+                _create_socket(this.name, port, host, local_addr, is_unix_socket, done, proxy);
             },
             validate: function (socket) {
                 return socket.__fromPool && socket.writable;
@@ -91,12 +221,12 @@ function get_pool (port, host, local_addr, is_unix_socket, max) {
 }
 
 // Get a socket for the given attributes.
-exports.get_client = function (port, host, local_addr, is_unix_socket, callback) {
+exports.get_client = function (port, host, local_addr, is_unix_socket, callback, proxy) {
     if (cfg.pool_concurrency_max == 0) {
-        return _create_socket(null, port, host, local_addr, is_unix_socket, callback);
+        return _create_socket(null, port, host, local_addr, is_unix_socket, callback, proxy);
     }
 
-    const pool = get_pool(port, host, local_addr, is_unix_socket, cfg.pool_concurrency_max);
+    const pool = get_pool(port, host, local_addr, is_unix_socket, cfg.pool_concurrency_max, proxy);
     if (pool.waitingClientsCount() >= cfg.pool_concurrency_max) {
         return callback("Too many waiting clients for pool", null);
     }

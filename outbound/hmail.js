@@ -364,7 +364,7 @@ class HMailItem extends events.EventEmitter {
         this.loginfo(`Attempting to deliver to: ${host}:${port}${mx.using_lmtp ? " using LMTP" : ""} (${delivery_queue.length()}) (${temp_fail_queue.length()})`);
         client_pool.get_client(port, host, mx.bind, mx.path ? true : false, function (err, socket) {
             if (err) {
-                if (err.stack.indexOf('ECONNREFUSED') > -1){
+                if (err.stack && err.stack.indexOf('ECONNREFUSED') > -1){
                     return self.bounce("unspecified");
                 }
                 logger.logerror(`[outbound] Failed to get pool entry: ${err}`);
